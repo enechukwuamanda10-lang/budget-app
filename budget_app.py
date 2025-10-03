@@ -10,13 +10,13 @@ from google.oauth2.service_account import Credentials
 import json
 
 # --- CONFIG: use Streamlit secrets ---
-# Make sure your Streamlit secrets.toml has [SERVICE_ACCOUNT] and SHEET_ID
 sa_info = st.secrets["SERVICE_ACCOUNT"]
 if isinstance(sa_info, str):
     sa_info = json.loads(sa_info)
 
 SHEET_ID = st.secrets["SHEET_ID"]
 
+# ------------------ helpers for Google Sheets ------------------
 def connect_sheet():
     creds = Credentials.from_service_account_info(
         sa_info,
@@ -29,10 +29,6 @@ def connect_sheet():
     sh = gc.open_by_key(SHEET_ID)
     return sh
 
-    except Exception as e:
-        st.error(f"Could not connect to Google Sheets: {e}")
-        st.stop()
-
 def ensure_ws(sh, title, headers):
     """Return worksheet; create with headers if not exist."""
     try:
@@ -41,7 +37,7 @@ def ensure_ws(sh, title, headers):
         ws = sh.add_worksheet(title=title, rows="100", cols="20")
         ws.append_row(headers)
         return ws
-    # ensure header row exists & matches (if not, set it)
+    # ensure header row exists & matches
     row1 = ws.row_values(1)
     if row1 != headers:
         try:
@@ -59,7 +55,7 @@ def load_data_from_sheets(cat_ws, exp_ws):
         cat_records = []
     for r in cat_records:
         name = r.get("category", "").strip()
-        if not name:
+        if name == "":
             continue
         cid = r.get("id") or uuid.uuid4().hex
         budget = int(float(r.get("budget", 0) or 0))
@@ -72,7 +68,7 @@ def load_data_from_sheets(cat_ws, exp_ws):
         exp_records = []
     for r in exp_records:
         cat = r.get("category", "").strip()
-        if not cat:
+        if cat == "":
             continue
         eid = r.get("id") or uuid.uuid4().hex
         try:
@@ -99,12 +95,18 @@ def append_expense(exp_ws, category, amount, note, date):
 def delete_category_and_its_expenses(cat_ws, exp_ws, category_name):
     # delete category rows
     vals = cat_ws.get_all_values()
-    rows_to_delete = [i for i, row in enumerate(vals[1:], start=2) if len(row) >= 2 and row[1] == category_name]
+    rows_to_delete = []
+    for i, row in enumerate(vals[1:], start=2):
+        if len(row) >= 2 and row[1] == category_name:
+            rows_to_delete.append(i)
     for r in reversed(rows_to_delete):
         cat_ws.delete_rows(r)
     # delete expenses rows matching category
     exp_vals = exp_ws.get_all_values()
-    rows_to_delete = [i for i, row in enumerate(exp_vals[1:], start=2) if len(row) >= 2 and row[1] == category_name]
+    rows_to_delete = []
+    for i, row in enumerate(exp_vals[1:], start=2):
+        if len(row) >= 2 and row[1] == category_name:
+            rows_to_delete.append(i)
     for r in reversed(rows_to_delete):
         exp_ws.delete_rows(r)
 
@@ -132,6 +134,7 @@ sh = connect_sheet()
 cat_ws = ensure_ws(sh, "categories", ["id", "category", "budget", "type"])
 exp_ws = ensure_ws(sh, "expenses", ["id", "category", "amount", "note", "date"])
 
+# load into session state
 if "categories" not in st.session_state:
     st.session_state.categories = load_data_from_sheets(cat_ws, exp_ws)
 
@@ -168,7 +171,7 @@ with st.expander("💸 Log Expense", expanded=True):
     else:
         st.info("Add a category first.")
 
-# --- Manage categories ---
+# --- Manage categories (delete) ---
 with st.expander("🗂️ Manage Categories", expanded=False):
     if st.session_state.categories:
         to_delete = st.selectbox("Select category to delete", list(st.session_state.categories.keys()), key="del_cat")
@@ -202,6 +205,7 @@ if summary:
         progress = row["Spent"] / row["Budget"] if row["Budget"] > 0 else 0
         st.write(f"**{row['Category']} ({row['Type']})**")
         st.progress(min(progress, 1.0))
+
 else:
     st.info("No categories/expenses yet.")
 
@@ -221,4 +225,50 @@ else:
 with st.expander("✏️ Edit / Delete an Expense", expanded=False):
     if history:
         manage_cat = st.selectbox("Choose category", list(st.session_state.categories.keys()), key="man_cat")
-        exps = st.session
+        exps = st.session_state.categories[manage_cat]["expenses"]
+        if exps:
+            exp_options = [f"{i+1}. {e['amount']} ({e.get('note','')}) on {e['date']}" for i, e in enumerate(exps)]
+            sel = st.selectbox("Select expense", exp_options, key="man_select")
+            idx = exp_options.index(sel)
+            sel_exp = exps[idx]
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Delete selected expense", key="del_exp_btn"):
+                    delete_expense_by_id(exp_ws, sel_exp["id"])
+                    st.session_state.categories = load_data_from_sheets(cat_ws, exp_ws)
+                    st.success("Expense deleted.")
+            with col2:
+                new_amt = st.number_input("Edit amount", min_value=0, step=100, value=sel_exp["amount"], key="edit_amount")
+                new_note = st.text_input("Edit note", value=sel_exp.get("note",""), key="edit_note")
+                if st.button("Save edit", key="save_edit_btn"):
+                    update_expense_amount(exp_ws, sel_exp["id"], int(new_amt), new_note)
+                    st.session_state.categories = load_data_from_sheets(cat_ws, exp_ws)
+                    st.success("Expense updated.")
+        else:
+            st.info("No expenses in this category yet.")
+    else:
+        st.info("No expenses to manage yet.")
+
+# Charts
+st.header("📈 Visuals")
+if summary:
+    fig, ax = plt.subplots()
+    x = range(len(df))
+    ax.bar([i-0.2 for i in x], df["Budget"], width=0.4, label="Budget")
+    ax.bar([i+0.2 for i in x], df["Spent"], width=0.4, label="Spent")
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(df["Category"], rotation=45)
+    ax.legend()
+    st.pyplot(fig)
+
+    if total_spent > 0:
+        fig2, ax2 = plt.subplots()
+        ax2.pie(df["Spent"], labels=df["Category"], autopct='%1.1f%%', startangle=90, wedgeprops={'width':0.4})
+        ax2.set_title("Expense Breakdown")
+        st.pyplot(fig2)
+
+# Reset local session cache (does NOT delete sheet data)
+if st.button("🧹 Clear local session cache"):
+    if "categories" in st.session_state:
+        del st.session_state["categories"]
+    st.experimental_rerun()
